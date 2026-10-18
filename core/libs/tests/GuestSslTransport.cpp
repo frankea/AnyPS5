@@ -37,6 +37,11 @@ int APS5_VABI sceSslSetVerifyCallback(int, int (APS5_VABI *)(int, unsigned int, 
 int APS5_VABI sceSslConnect(int);
 int APS5_VABI sceSslRead(int, void*, std::size_t, int);
 int APS5_VABI sceSslWrite(int, void*, std::size_t, int);
+int APS5_VABI sceSslEnableVerifyOption(int, std::uint32_t);
+int APS5_VABI sceSslDisableVerifyOption(int, std::uint32_t);
+int APS5_VABI sceSslSetMinSslVersion(int, int);
+int APS5_VABI sceSslSetAlpn(int, const char*);
+const char* APS5_VABI sceSslGetAlpnSelected(int);
 int APS5_VABI socket_nid_postfix(int, int, int);
 int APS5_VABI connect_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI close_nid_postfix(int);
@@ -49,6 +54,14 @@ int APS5_VABI sceNetSocketClose(int);
 namespace {
 
 constexpr int ParallelConnections = 4;
+constexpr int ErrorCnCheck = static_cast<int>(0x8095f00b);
+constexpr int ErrorUnknownCa = static_cast<int>(0x8095f00c);
+constexpr std::uint32_t ServerVerify = 0x1, CnCheck = 0x4, NotAfterCheck = 0x8, NotBeforeCheck = 0x10, KnownCaCheck = 0x20;
+constexpr std::uint32_t AllChecks = ServerVerify | CnCheck | NotAfterCheck | NotBeforeCheck | KnownCaCheck;
+constexpr int VersionTls12 = 5;
+const char* ServerProtocols[] = {"http/1.1", nullptr};
+
+enum class Serve { Close, Exchange };
 
 void Require(bool condition, const char* message) {
     if (condition) return;
@@ -100,6 +113,7 @@ struct Server {
         Require(mbedtls_ssl_conf_own_cert(&config, &certificate, &key) == 0, "set server certificate");
         mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_REQUIRED);
         mbedtls_ssl_conf_ca_chain(&config, &authority, nullptr);
+        Require(mbedtls_ssl_conf_alpn_protocols(&config, ServerProtocols) == 0, "set server protocols");
         Require(mbedtls_net_bind(&listener, "127.0.0.1", "0", MBEDTLS_NET_PROTO_TCP) == 0, "bind loopback listener");
         sockaddr_in address{};
 #ifdef _WIN32
@@ -121,7 +135,8 @@ struct Server {
         mbedtls_net_free(&listener);
     }
 
-    void Serve(bool handshakeSucceeds) {
+    void Serve(Serve mode, bool requireClientCertificate = true) {
+        mbedtls_ssl_conf_authmode(&config, requireClientCertificate ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
         mbedtls_net_context client;
         mbedtls_net_init(&client);
         mbedtls_ssl_context ssl;
@@ -131,8 +146,9 @@ struct Server {
         } else {
             mbedtls_ssl_set_bio(&ssl, &client, mbedtls_net_send, mbedtls_net_recv, nullptr);
             const int handshake = mbedtls_ssl_handshake(&ssl);
-            if ((handshake == 0) != handshakeSucceeds) failure = "server handshake result differs, error " + std::to_string(handshake);
-            else if (handshake == 0) Exchange(ssl);
+            if (handshake != 0) failure = "server handshake failed, error " + std::to_string(handshake);
+            else if (mode == Serve::Exchange) Exchange(ssl);
+            else mbedtls_ssl_close_notify(&ssl);
         }
         mbedtls_ssl_free(&ssl);
         mbedtls_net_free(&client);
@@ -193,15 +209,28 @@ int main(int argc, char** argv) {
     if (sockets.net) Require(sceNetInit_nid_postfix() == 0, "initialize libSceNet");
     Server server;
     std::thread serving([&] {
-        server.Serve(false);
-        server.Serve(true);
-        for (int index = 0; index < ParallelConnections; ++index) server.Serve(true);
+        server.Serve(Serve::Close, false);
+        server.Serve(Serve::Close, false);
+        server.Serve(Serve::Close);
+        server.Serve(Serve::Close);
+        server.Serve(Serve::Exchange);
+        for (int index = 0; index < ParallelConnections; ++index) server.Serve(Serve::Exchange);
     });
 
     const int empty = sceSslInit_nid_postfix(256 * 1024);
-    const int withoutAuthority = sceSslCreateConnection(empty, -1, "localhost");
-    Require(Throws([&] { sceSslConnect(withoutAuthority); }), "a handshake without a loaded CA was attempted");
-    Require(sceSslDeleteConnection(withoutAuthority) == 0 && sceSslTerm_nid_postfix(empty) == 0, "release the context without CA");
+    const int unverifiedSocket = sockets.Open(server.port);
+    const int unverified = sceSslCreateConnection(empty, unverifiedSocket, "localhost");
+    Require(sceSslConnect(unverified) == 0, "with the initial verify options nothing is checked, so no loaded CA is no failure");
+    Require(sceSslDeleteConnection(unverified) == 0 && sockets.Close(unverifiedSocket) == 0, "release the unverified connection");
+    const int untrustedSocket = sockets.Open(server.port);
+    const int untrusted = sceSslCreateConnection(empty, untrustedSocket, "localhost");
+    Require(sceSslEnableVerifyOption(untrusted, ServerVerify | KnownCaCheck) == 0, "enable the CA check");
+    Require(sceSslConnect(untrusted) == ErrorUnknownCa, "a server certificate without a loaded CA passed the CA check");
+    Require(sceSslConnect(untrusted) == ErrorUnknownCa, "a second connect did not repeat the verification result");
+    std::array<char, 16> scratch{};
+    Require(Throws([&] { sceSslRead(untrusted, scratch.data(), 1, 0); }), "a connection that failed verification was readable");
+    Require(sceSslDeleteConnection(untrusted) == 0 && sockets.Close(untrustedSocket) == 0, "release the untrusted connection");
+    Require(sceSslTerm_nid_postfix(empty) == 0, "release the context without CA");
 
     const int context = sceSslInit_nid_postfix(1024 * 1024);
     std::string root = RootPem;
@@ -224,18 +253,32 @@ int main(int argc, char** argv) {
 
     const int mismatchSocket = sockets.Open(server.port);
     const int mismatch = sceSslCreateConnection(context, mismatchSocket, "example.com");
-    Require(Throws([&] { sceSslConnect(mismatch); }), "a certificate for another host was accepted");
-    Require(Throws([&] { sceSslRead(mismatch, root.data(), 1, 0); }), "a failed handshake left the connection usable");
+    Require(sceSslEnableVerifyOption(mismatch, AllChecks) == 0, "enable every check");
+    Require(sceSslConnect(mismatch) == ErrorCnCheck, "a certificate for another host passed the host name check");
+    Require(sceSslConnect(mismatch) == ErrorCnCheck, "a second connect did not repeat the host name result");
+    Require(Throws([&] { sceSslRead(mismatch, root.data(), 1, 0); }), "a failed verification left the connection usable");
     Require(sceSslDeleteConnection(mismatch) == 0 && sockets.Close(mismatchSocket) == 0, "release the mismatched connection");
+
+    const int lenientSocket = sockets.Open(server.port);
+    const int lenient = sceSslCreateConnection(context, lenientSocket, "example.com");
+    Require(sceSslEnableVerifyOption(lenient, AllChecks) == 0 && sceSslDisableVerifyOption(lenient, CnCheck) == 0, "disable the host name check");
+    Require(sceSslConnect(lenient) == 0, "a disabled host name check still failed the handshake");
+    Require(sceSslGetAlpnSelected(lenient) == nullptr, "a protocol was selected without an ALPN list");
+    Require(sceSslDeleteConnection(lenient) == 0 && sockets.Close(lenientSocket) == 0, "release the lenient connection");
 
     const int descriptor = sockets.Open(server.port);
     const int connection = sceSslCreateConnection(context, descriptor, "localhost");
     std::array<char, 16> buffer{};
+    Require(sceSslEnableVerifyOption(connection, AllChecks) == 0, "enable every check on the main connection");
+    Require(sceSslSetMinSslVersion(connection, VersionTls12) == 0 && sceSslSetAlpn(connection, "h2,http/1.1") == 0, "set version and ALPN");
+    Require(sceSslGetAlpnSelected(connection) == nullptr, "a protocol was selected before the handshake");
     Require(Throws([&] { sceSslRead(connection, buffer.data(), buffer.size(), 0); }), "read before the handshake");
     Require(Throws([&] { sceSslWrite(connection, buffer.data(), buffer.size(), 0); }), "write before the handshake");
     Require(sceSslConnect(connection) == 0, "handshake with the loopback server");
     Require(InUse(context) > loaded, "the connection is not charged to the context pool");
-    Require(Throws([&] { sceSslConnect(connection); }), "a second handshake was accepted");
+    Require(sceSslConnect(connection) == 0, "a second connect after success did not return the same result");
+    const char* selected = sceSslGetAlpnSelected(connection);
+    Require(selected && std::strcmp(selected, "http/1.1") == 0, "the negotiated ALPN protocol is not reported");
     Require(Throws([&] { sceSslWrite(connection, buffer.data(), 1, 1); }), "unknown write flags were accepted");
     Require(Throws([&] { sceSslRead(connection, buffer.data(), 1, 3); }), "peek was accepted");
     char request[] = "ping";
@@ -253,6 +296,7 @@ int main(int argc, char** argv) {
             const int parallel = sceSslCreateConnection(context, parallelSocket, "localhost");
             std::array<char, 16> reply{};
             char ping[] = "ping";
+            Require(sceSslEnableVerifyOption(parallel, AllChecks) == 0, "enable every check on a parallel connection");
             Require(sceSslConnect(parallel) == 0 && sceSslWrite(parallel, ping, 4, 0) == 4, "parallel handshake or write");
             Require(sceSslRead(parallel, reply.data(), reply.size(), 0) == 4 && std::memcmp(reply.data(), "pong", 4) == 0, "parallel reply");
             Require(sceSslRead(parallel, reply.data(), reply.size(), 0) == 0, "parallel end of stream");
