@@ -1497,7 +1497,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             Require(nibbles || floating || (exportedMask & packedMask) == packedMask, "partial writes of " + packed + " color target are unsupported");
             if ((exportedMask & packedMask) != packedMask || color.mergeBlend != 0u) {
                 const std::string merged = color.mergeBlend != 0u ? "blending into " : "partial writes of ";
-                Require(color.mipCount == 1u && color.depth == 1u && color.layers == 1u && color.arrayLastSlice == 0u, merged + "a mipmapped, volume or array " + std::string(PackedColorTargetName(color.packing)) + " color target are not implemented");
+                if (color.mipCount != 1u || color.depth != 1u || color.layers != 1u || color.arrayLastSlice != 0u) {
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail), " (%ux%u, mip %u of %u%s, depth %u slice %u, layers %u, last slice %u)", color.extent.width, color.extent.height, color.mip, color.mipCount, color.mipTail ? " in the tail" : "", color.depth, color.depthSlice, color.layers, color.arrayLastSlice);
+                    Require(false, merged + "a mipmapped, volume or array " + std::string(PackedColorTargetName(color.packing)) + " color target are not implemented" + detail);
+                }
                 Require(std::ranges::none_of(result.colors, [](const ColorTarget& other) { return other.partialWriteMask != 0; }), merged + "more than one packed color target are not implemented");
                 color.partialWriteMask = PackedWriteMask(color.packing, mapping, exportedMask & packedMask);
                 Require(color.partialWriteMask != 0u, merged + packed + " color target that writes none of its channels is not implemented");
