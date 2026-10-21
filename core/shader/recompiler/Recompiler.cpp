@@ -1394,6 +1394,8 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(merge.samples);
         mix(static_cast<std::uint64_t>(merge.packing));
         mix(merge.blendControl);
+        mix(merge.layered);
+        mix(merge.firstSlice);
         for (const auto word : merge.descriptor) mix(word);
     }
     if (request.context.vertex) {
